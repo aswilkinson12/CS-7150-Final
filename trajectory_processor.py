@@ -17,7 +17,7 @@ class TrajectoryConfig:
     """
     
     # Spatial discretization
-    coverage: float = 32.0  # meters
+    coverage: float = 64.0  # meters
     grid_size: int = 16
     cell_size: float = 2.0  # meters per cell
     

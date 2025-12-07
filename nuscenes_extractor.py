@@ -3,7 +3,9 @@ nuScenes Extractor - Scene-Aware Trajectories
 Extracts: ego trajectory + scene context + nearby agents
 Uses ONLY metadata - no sensor data needed (438MB, not 350GB)
 
-Updated to use TrajectoryProcessor v2
+FIXED VERSION:
+1. Velocity filter: Skip stopped/parked vehicles
+2. Agent coordinates: Transform to ego-centric before discretization
 """
 
 import numpy as np
@@ -27,7 +29,7 @@ class NuScenesExtractor:
         print(f"Loading nuScenes {version}...")
         self.nusc = NuScenes(version=version, dataroot=dataroot, verbose=True)
 
-        # Use v2 enhanced processor
+        # Use processor
         self.processor = create_enhanced_processor()
 
         print(f"Loaded {len(self.nusc.scene)} scenes")
@@ -36,20 +38,23 @@ class NuScenesExtractor:
         self,
         sample_token: str,
         ego_pose: np.ndarray,
+        ego_rotation: Quaternion,  # ★ ADDED: Need rotation for transformation
         radius: float = 30.0,
         max_agents: int = 5
     ) -> List[Dict]:
         """
         Get nearby agents from metadata
+        ★ FIXED: Now transforms agent positions to ego-centric coordinates
 
         Args:
             sample_token: Current sample
-            ego_pose: Ego vehicle pose (x, y)
+            ego_pose: Ego vehicle pose (x, y) in global coordinates
+            ego_rotation: Ego vehicle rotation (quaternion)
             radius: Search radius in meters
             max_agents: Maximum number of agents
 
         Returns:
-            List of agent data
+            List of agent data with ego-centric positions
         """
         sample = self.nusc.get('sample', sample_token)
         nearby_agents = []
@@ -63,29 +68,95 @@ class NuScenesExtractor:
             if not any(veh in category for veh in ['vehicle', 'car', 'truck', 'bus']):
                 continue
 
-            # Get agent position
-            agent_pos = np.array(ann['translation'][:2])
+            # Get agent position (GLOBAL coordinates)
+            agent_pos_global = np.array(ann['translation'][:2])
 
             # Compute distance to ego
-            distance = np.linalg.norm(agent_pos - ego_pose)
+            distance = np.linalg.norm(agent_pos_global - ego_pose)
 
             if distance < radius and distance > 0.5:  # Exclude ego itself
-                # Get agent trajectory (if available)
-                agent_trajectory = self._get_agent_trajectory(ann_token)
+                # ★ TRANSFORM to ego-centric coordinates
+                agent_pos_ego = self._global_to_ego_point(
+                    agent_pos_global,
+                    ego_pose,
+                    ego_rotation
+                )
+
+                # Get agent trajectory (in global coordinates)
+                agent_trajectory_global = self._get_agent_trajectory(ann_token)
+
+                # ★ TRANSFORM trajectory to ego-centric
+                if len(agent_trajectory_global) > 0:
+                    agent_trajectory_ego = self._global_to_ego_trajectory(
+                        agent_trajectory_global,
+                        ego_pose,
+                        ego_rotation
+                    )
+                else:
+                    agent_trajectory_ego = np.array([])
 
                 nearby_agents.append({
                     'type': category,
-                    'position': agent_pos,
+                    'position': agent_pos_ego,         # ★ Now ego-centric
                     'distance': distance,
-                    'trajectory': agent_trajectory
+                    'trajectory': agent_trajectory_ego  # ★ Now ego-centric
                 })
 
         # Sort by distance and return closest
         nearby_agents.sort(key=lambda x: x['distance'])
         return nearby_agents[:max_agents]
 
+    def _global_to_ego_point(
+        self,
+        point: np.ndarray,
+        ego_pose: np.ndarray,
+        ego_rotation: Quaternion
+    ) -> np.ndarray:
+        """
+        Transform single point from global to ego-centric coordinates
+
+        Args:
+            point: (x, y) in global coordinates
+            ego_pose: Ego position (x, y) in global coordinates
+            ego_rotation: Ego rotation (quaternion)
+
+        Returns:
+            (x, y) in ego-centric coordinates
+        """
+        # Translate
+        point_centered = point - ego_pose
+
+        # Rotate to ego frame
+        yaw = quaternion_yaw(ego_rotation)
+        cos_yaw = np.cos(-yaw)
+        sin_yaw = np.sin(-yaw)
+
+        rotation_matrix = np.array([
+            [cos_yaw, -sin_yaw],
+            [sin_yaw, cos_yaw]
+        ])
+
+        point_ego = point_centered @ rotation_matrix.T
+        return point_ego
+
+    def _global_to_ego_trajectory(
+        self,
+        trajectory: np.ndarray,
+        ego_pose: np.ndarray,
+        ego_rotation: Quaternion
+    ) -> np.ndarray:
+        """Transform trajectory from global to ego-centric coordinates"""
+        if len(trajectory) == 0:
+            return trajectory
+
+        ego_trajectory = np.array([
+            self._global_to_ego_point(point, ego_pose, ego_rotation)
+            for point in trajectory
+        ])
+        return ego_trajectory
+
     def _get_agent_trajectory(self, ann_token: str, history_length: int = 4) -> np.ndarray:
-        """Get agent's historical trajectory"""
+        """Get agent's historical trajectory (in global coordinates)"""
         trajectory = []
         current_token = ann_token
 
@@ -116,7 +187,7 @@ class NuScenesExtractor:
         Returns:
             List of scene context tokens
         """
-        # Use processor v2's scene context extraction
+        # Use processor scene context extraction
         scene_data = {
             'description': scene['description'],
             'location': self.nusc.get('log', scene['log_token'])['location']
@@ -246,9 +317,11 @@ class NuScenesExtractor:
         if history is None or future is None:
             return None
 
-        # Get ego pose for nearby agents
+        # Get ego pose AND rotation for nearby agents
+        # ★ FIXED: Now get rotation too
         ego_pose_data = self.nusc.get('ego_pose', sample['data']['LIDAR_TOP'])
         ego_pose = np.array(ego_pose_data['translation'][:2])
+        ego_rotation = Quaternion(ego_pose_data['rotation'])
 
         # Extract scene context
         scene_context = self.get_scene_context(sample, scene)
@@ -256,10 +329,12 @@ class NuScenesExtractor:
         # Extract lane context
         lane_context = self.get_lane_context(history)
 
-        # Get nearby agents
+        # Get nearby agents (now with rotation for transformation)
+        # ★ FIXED: Pass rotation
         nearby_agents_data = self.get_nearby_agents(
             sample_token,
             ego_pose,
+            ego_rotation,  # ★ Now includes rotation
             radius=30.0,
             max_agents=3
         )
@@ -267,7 +342,7 @@ class NuScenesExtractor:
         # Encode agents
         agent_tokens = self.processor.encode_nearby_agents(nearby_agents_data)
 
-        # Create enhanced sequence using v2 method
+        # Create enhanced sequence using processor method
         sequence = self.processor.process_enhanced_trajectory(
             history,
             future,
@@ -286,11 +361,11 @@ class NuScenesExtractor:
             'lane_context': lane_context,
             'agent_tokens': agent_tokens,
             'num_nearby_agents': len(nearby_agents_data),
-            'nearby_agents_data': nearby_agents_data,  # Added for visualization
+            'nearby_agents_data': nearby_agents_data,
             'input_tokens': sequence['input_tokens'],
             'target_tokens': sequence['target_tokens'],
-            'input': sequence['input_tokens'],  # Alias for dataset compatibility
-            'target': sequence['target_tokens'],  # Alias for dataset compatibility
+            'input': sequence['input_tokens'],
+            'target': sequence['target_tokens'],
             'is_lane_change': is_lane_change,
             'scene_description': scene['description']
         }
@@ -314,6 +389,7 @@ class NuScenesExtractor:
         print(f"Scene context: ✓")
         print(f"Lane context: ✓")
         print(f"Nearby agents: ✓")
+        print(f"Velocity filter: ✓ (>2 m/s)")
         print(f"Vocabulary: {self.processor.config.vocab_size}")
 
         dataset = []
@@ -334,7 +410,6 @@ class NuScenesExtractor:
                     if 'vehicle' not in ann['category_name']:
                         continue
 
-                    # Extract enhanced sample
                     enhanced_sample = self.extract_enhanced_sample(
                         sample_token,
                         ann['instance_token'],
@@ -342,6 +417,13 @@ class NuScenesExtractor:
                     )
 
                     if enhanced_sample is not None:
+                        hist_motion = np.abs(enhanced_sample['ego_history']).max()
+                        fut_motion = np.abs(enhanced_sample['ego_future']).max()
+
+                        # Skip if total displacement < 2m (parked/stopped vehicles)
+                        if hist_motion < 2.0 or fut_motion < 2.0:
+                            continue
+
                         dataset.append(enhanced_sample)
                         sample_count += 1
 
