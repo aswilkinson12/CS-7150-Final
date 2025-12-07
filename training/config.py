@@ -12,11 +12,11 @@ class TrainingConfig:
     """Training hyperparameters"""
     
     # Model architecture
-    vocab_size: int = 259
+    vocab_size: int = 280
     n_embd: int = 384
     n_layer: int = 6
     n_head: int = 6
-    max_seq_len: int = 20
+    max_seq_len: int = 64
     dropout: float = 0.1
     
     # Training

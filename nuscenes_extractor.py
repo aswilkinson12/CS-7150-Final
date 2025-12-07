@@ -1,104 +1,424 @@
 """
-Extract Full nuScenes Trainval Dataset
-Handles both mini and full datasets
+nuScenes Extractor - Scene-Aware Trajectories
+Extracts: ego trajectory + scene context + nearby agents
+Uses ONLY metadata - no sensor data needed (438MB, not 350GB)
+
+Updated to use TrajectoryProcessor v2
 """
 
-import sys
-import os
-import argparse
+import numpy as np
+from nuscenes.nuscenes import NuScenes
+from nuscenes.eval.common.utils import quaternion_yaw
+from pyquaternion import Quaternion
+from tqdm import tqdm
+import pickle
+from typing import Dict, List, Tuple, Optional
 
-sys.path.append('.')
-from utils.nuscenes_helper import NuScenesTrajectoryExtractor
+from trajectory_processor import create_enhanced_processor, TrajectoryConfig
+
+
+class NuScenesExtractor:
+    """
+    Extract scene-aware trajectories from nuScenes metadata
+    Includes: scene type, lanes, intersections, nearby agents
+    """
+
+    def __init__(self, dataroot: str, version: str = 'v1.0-trainval'):
+        print(f"Loading nuScenes {version}...")
+        self.nusc = NuScenes(version=version, dataroot=dataroot, verbose=True)
+
+        # Use v2 enhanced processor
+        self.processor = create_enhanced_processor()
+
+        print(f"Loaded {len(self.nusc.scene)} scenes")
+
+    def get_nearby_agents(
+        self,
+        sample_token: str,
+        ego_pose: np.ndarray,
+        radius: float = 30.0,
+        max_agents: int = 5
+    ) -> List[Dict]:
+        """
+        Get nearby agents from metadata
+
+        Args:
+            sample_token: Current sample
+            ego_pose: Ego vehicle pose (x, y)
+            radius: Search radius in meters
+            max_agents: Maximum number of agents
+
+        Returns:
+            List of agent data
+        """
+        sample = self.nusc.get('sample', sample_token)
+        nearby_agents = []
+
+        # Get all annotations in current sample
+        for ann_token in sample['anns']:
+            ann = self.nusc.get('sample_annotation', ann_token)
+
+            # Filter by category (vehicles only)
+            category = ann['category_name']
+            if not any(veh in category for veh in ['vehicle', 'car', 'truck', 'bus']):
+                continue
+
+            # Get agent position
+            agent_pos = np.array(ann['translation'][:2])
+
+            # Compute distance to ego
+            distance = np.linalg.norm(agent_pos - ego_pose)
+
+            if distance < radius and distance > 0.5:  # Exclude ego itself
+                # Get agent trajectory (if available)
+                agent_trajectory = self._get_agent_trajectory(ann_token)
+
+                nearby_agents.append({
+                    'type': category,
+                    'position': agent_pos,
+                    'distance': distance,
+                    'trajectory': agent_trajectory
+                })
+
+        # Sort by distance and return closest
+        nearby_agents.sort(key=lambda x: x['distance'])
+        return nearby_agents[:max_agents]
+
+    def _get_agent_trajectory(self, ann_token: str, history_length: int = 4) -> np.ndarray:
+        """Get agent's historical trajectory"""
+        trajectory = []
+        current_token = ann_token
+
+        for _ in range(history_length):
+            if current_token == '':
+                break
+
+            ann = self.nusc.get('sample_annotation', current_token)
+            trajectory.append(ann['translation'][:2])
+
+            # Move to previous annotation
+            current_token = ann['prev']
+
+        if len(trajectory) > 0:
+            trajectory = np.array(trajectory[::-1])  # Reverse to chronological
+            return trajectory
+        else:
+            return np.array([])
+
+    def get_scene_context(self, sample: Dict, scene: Dict) -> List[int]:
+        """
+        Extract scene context from metadata
+
+        Args:
+            sample: nuScenes sample
+            scene: nuScenes scene
+
+        Returns:
+            List of scene context tokens
+        """
+        # Use processor v2's scene context extraction
+        scene_data = {
+            'description': scene['description'],
+            'location': self.nusc.get('log', scene['log_token'])['location']
+        }
+
+        return self.processor.extract_scene_context(scene_data)
+
+    def get_lane_context(self, trajectory: np.ndarray) -> List[int]:
+        """Determine lane context from trajectory"""
+        return self.processor.extract_lane_context(trajectory)
+
+    def _get_ego_trajectory(
+        self,
+        sample_token: str,
+        instance_token: str,
+        history_length: int = 4,
+        future_length: int = 6
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Get ego-centric trajectory
+
+        Args:
+            sample_token: Current sample token
+            instance_token: Vehicle instance token
+            history_length: Number of past samples
+            future_length: Number of future samples
+
+        Returns:
+            (history, future) or (None, None) if invalid
+        """
+        # Get the annotation for this vehicle in this sample
+        sample = self.nusc.get('sample', sample_token)
+
+        # Find the annotation for this instance
+        ann_token = None
+        for token in sample['anns']:
+            ann = self.nusc.get('sample_annotation', token)
+            if ann['instance_token'] == instance_token:
+                ann_token = token
+                break
+
+        if ann_token is None:
+            return None, None
+
+        # Get current annotation
+        current_ann = self.nusc.get('sample_annotation', ann_token)
+        current_pose = np.array(current_ann['translation'][:2])
+        current_rotation = Quaternion(current_ann['rotation'])
+
+        # Collect history
+        history_global = []
+        temp_token = ann_token
+        for _ in range(history_length):
+            if temp_token == '':
+                break
+            ann = self.nusc.get('sample_annotation', temp_token)
+            history_global.append(ann['translation'][:2])
+            temp_token = ann['prev']
+
+        if len(history_global) < history_length:
+            return None, None
+
+        history_global = np.array(history_global[::-1])  # Reverse to chronological
+
+        # Collect future
+        future_global = []
+        temp_token = current_ann['next']
+        for _ in range(future_length):
+            if temp_token == '':
+                break
+            ann = self.nusc.get('sample_annotation', temp_token)
+            future_global.append(ann['translation'][:2])
+            temp_token = ann['next']
+
+        if len(future_global) < future_length:
+            return None, None
+
+        future_global = np.array(future_global)
+
+        # Convert to ego-centric coordinates
+        def global_to_ego(points, ego_pose, ego_rotation):
+            """Transform global coordinates to ego-centric"""
+            # Translate
+            points_centered = points - ego_pose
+
+            # Rotate to ego frame
+            yaw = quaternion_yaw(ego_rotation)
+            cos_yaw = np.cos(-yaw)
+            sin_yaw = np.sin(-yaw)
+
+            rotation_matrix = np.array([
+                [cos_yaw, -sin_yaw],
+                [sin_yaw, cos_yaw]
+            ])
+
+            points_ego = points_centered @ rotation_matrix.T
+            return points_ego
+
+        history_ego = global_to_ego(history_global, current_pose, current_rotation)
+        future_ego = global_to_ego(future_global, current_pose, current_rotation)
+
+        return history_ego, future_ego
+
+    def extract_enhanced_sample(
+        self,
+        sample_token: str,
+        instance_token: str,
+        scene: Dict
+    ) -> Optional[Dict]:
+        """
+        Extract single enhanced trajectory sample
+
+        Returns:
+            Dict with:
+                - ego_history/future
+                - scene_context
+                - lane_context
+                - nearby_agents
+                - input_tokens
+                - target_tokens
+        """
+        sample = self.nusc.get('sample', sample_token)
+
+        # Get ego trajectory
+        history, future = self._get_ego_trajectory(sample_token, instance_token)
+
+        if history is None or future is None:
+            return None
+
+        # Get ego pose for nearby agents
+        ego_pose_data = self.nusc.get('ego_pose', sample['data']['LIDAR_TOP'])
+        ego_pose = np.array(ego_pose_data['translation'][:2])
+
+        # Extract scene context
+        scene_context = self.get_scene_context(sample, scene)
+
+        # Extract lane context
+        lane_context = self.get_lane_context(history)
+
+        # Get nearby agents
+        nearby_agents_data = self.get_nearby_agents(
+            sample_token,
+            ego_pose,
+            radius=30.0,
+            max_agents=3
+        )
+
+        # Encode agents
+        agent_tokens = self.processor.encode_nearby_agents(nearby_agents_data)
+
+        # Create enhanced sequence using v2 method
+        sequence = self.processor.process_enhanced_trajectory(
+            history,
+            future,
+            scene_context,
+            lane_context,
+            agent_tokens
+        )
+
+        # Check if lane change
+        is_lane_change = abs(future[-1, 1] - future[0, 1]) > 2.0
+
+        return {
+            'ego_history': history,
+            'ego_future': future,
+            'scene_context': scene_context,
+            'lane_context': lane_context,
+            'agent_tokens': agent_tokens,
+            'num_nearby_agents': len(nearby_agents_data),
+            'nearby_agents_data': nearby_agents_data,  # Added for visualization
+            'input_tokens': sequence['input_tokens'],
+            'target_tokens': sequence['target_tokens'],
+            'input': sequence['input_tokens'],  # Alias for dataset compatibility
+            'target': sequence['target_tokens'],  # Alias for dataset compatibility
+            'is_lane_change': is_lane_change,
+            'scene_description': scene['description']
+        }
+
+    def extract_enhanced_dataset(
+        self,
+        output_path: str = './data/trajectories_full.pkl',
+        max_samples: Optional[int] = None
+    ) -> List[Dict]:
+        """
+        Extract complete enhanced dataset
+
+        Args:
+            output_path: Where to save
+            max_samples: Maximum samples (None = all)
+
+        Returns:
+            List of enhanced trajectory samples
+        """
+        print("\nExtracting trajectories with TrajectoryProcessor...")
+        print(f"Scene context: ✓")
+        print(f"Lane context: ✓")
+        print(f"Nearby agents: ✓")
+        print(f"Vocabulary: {self.processor.config.vocab_size}")
+
+        dataset = []
+        sample_count = 0
+
+        for scene in tqdm(self.nusc.scene, desc="Processing scenes"):
+            scene_token = scene['token']
+            sample_token = scene['first_sample_token']
+
+            while sample_token != '':
+                sample = self.nusc.get('sample', sample_token)
+
+                # Process each vehicle annotation
+                for ann_token in sample['anns']:
+                    ann = self.nusc.get('sample_annotation', ann_token)
+
+                    # Filter vehicles
+                    if 'vehicle' not in ann['category_name']:
+                        continue
+
+                    # Extract enhanced sample
+                    enhanced_sample = self.extract_enhanced_sample(
+                        sample_token,
+                        ann['instance_token'],
+                        scene
+                    )
+
+                    if enhanced_sample is not None:
+                        dataset.append(enhanced_sample)
+                        sample_count += 1
+
+                        if max_samples and sample_count >= max_samples:
+                            break
+
+                if max_samples and sample_count >= max_samples:
+                    break
+
+                sample_token = sample['next']
+
+            if max_samples and sample_count >= max_samples:
+                break
+
+        # Compute statistics
+        lane_changes = sum(1 for d in dataset if d['is_lane_change'])
+        avg_agents = np.mean([d['num_nearby_agents'] for d in dataset]) if dataset else 0
+
+        stats = {
+            'total_samples': len(dataset),
+            'lane_changes': lane_changes,
+            'lane_change_rate': lane_changes / len(dataset) if dataset else 0,
+            'avg_nearby_agents': avg_agents,
+            'vocab_size': self.processor.config.vocab_size
+        }
+
+        # Save
+        output_data = {
+            'data': dataset,
+            'stats': stats,
+            'config': self.processor.config
+        }
+
+        with open(output_path, 'wb') as f:
+            pickle.dump(output_data, f)
+
+        print(f"\n✓ Extracted {len(dataset)} samples")
+        print(f"  Lane changes: {lane_changes} ({100*lane_changes/len(dataset):.1f}%)")
+        print(f"  Avg nearby agents: {avg_agents:.1f}")
+        print(f"  Vocabulary size: {stats['vocab_size']}")
+        print(f"  Saved to: {output_path}")
+
+        return dataset
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Extract trajectories from nuScenes')
-    parser.add_argument('--version', type=str, default='v1.0-trainval',
-                        choices=['v1.0-mini', 'v1.0-trainval', 'v1.0-test'],
-                        help='nuScenes version to extract')
-    parser.add_argument('--dataroot', type=str, default='./data/nuscenes',
-                        help='Path to nuScenes data')
-    parser.add_argument('--output', type=str, default=None,
-                        help='Output pickle file name')
+    """Extract enhanced dataset"""
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataroot', type=str,
+                       default='./data/nuscenes',
+                       help='Path to nuScenes data')
+    parser.add_argument('--version', type=str,
+                       default='v1.0-trainval',
+                       help='nuScenes version')
+    parser.add_argument('--output', type=str,
+                       default='./data/trajectories_full.pkl',
+                       help='Output file')
     parser.add_argument('--max-samples', type=int, default=None,
-                        help='Maximum number of samples to extract (None = all)')
+                       help='Max samples to extract')
 
     args = parser.parse_args()
 
-    # Auto-generate output name
-    if args.output is None:
-        if 'mini' in args.version:
-            args.output = './data/trajectories_mini.pkl'
-        elif 'trainval' in args.version:
-            args.output = './data/trajectories_full.pkl'
-        else:
-            args.output = './data/trajectories.pkl'
-
-    print("=" * 70)
-    print("nuScenes Trajectory Extraction")
-    print("=" * 70)
-    print(f"Version: {args.version}")
-    print(f"Dataroot: {args.dataroot}")
-    print(f"Output: {args.output}")
-    print(f"Max samples: {args.max_samples if args.max_samples else 'All'}")
-    print("=" * 70)
-
-    # Check if data exists
-    if not os.path.exists(args.dataroot):
-        print(f"\n Error: nuScenes data not found at {args.dataroot}")
-        print("\nPlease download nuScenes data first:")
-        if 'mini' in args.version:
-            print("  wget https://www.nuscenes.org/data/v1.0-mini.tgz")
-            print(f"  tar -xf v1.0-mini.tgz -C {args.dataroot}")
-        else:
-            print("  See SCALING_TO_FULL_DATASET.md for download instructions")
-        return
-
     # Create extractor
-    print("\nInitializing extractor...")
-    try:
-        extractor = NuScenesTrajectoryExtractor(
-            dataroot=args.dataroot,
-            version=args.version
-        )
-    except Exception as e:
-        print(f"\n Error loading nuScenes: {e}")
-        print("\nMake sure you have the correct version installed:")
-        print(f"  Expected: {args.version} in {args.dataroot}")
-        return
+    extractor = NuScenesExtractor(
+        dataroot=args.dataroot,
+        version=args.version
+    )
 
-    # Extract trajectories
-    print("\nExtracting trajectories...")
-    print("This may take a while for large datasets...")
+    # Extract dataset
+    extractor.extract_enhanced_dataset(
+        output_path=args.output,
+        max_samples=args.max_samples
+    )
 
-    try:
-        dataset = extractor.extract_dataset(
-            output_path=args.output,
-            max_samples=args.max_samples
-        )
-
-        print("\n" + "=" * 70)
-        print(" Extraction Complete!")
-        print("=" * 70)
-        print(f"Extracted: {len(dataset)} trajectories")
-        print(f"Saved to: {args.output}")
-
-        # Print statistics
-        lane_changes = sum(1 for d in dataset if d['is_lane_change'])
-        print(f"\nStatistics:")
-        print(f"  Total samples: {len(dataset)}")
-        print(f"  Lane changes: {lane_changes} ({100 * lane_changes / len(dataset):.1f}%)")
-
-        print("\n Ready for training!")
-        print(f"Next command:")
-        print(f"  python training/train.py --data {args.output} --epochs 50")
-
-    except Exception as e:
-        print(f"\n Error during extraction: {e}")
-        import traceback
-        traceback.print_exc()
-        return
-
+    print("\n✓ Extraction complete!")
 
 
 if __name__ == "__main__":
