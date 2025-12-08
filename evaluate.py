@@ -255,13 +255,15 @@ def main():
     parser.add_argument('--data', type=str, default='./data/trajectories_full.pkl')
     parser.add_argument('--num-samples', type=int, default=10)
     parser.add_argument('--num-test-samples', type=int, default=1000)
+    parser.add_argument('--vocab-size', type=int, default=280,
+                        help='Model vocabulary size (280 for 16x16, 1051 for 32x32)')
     parser.add_argument('--output-dir', type=str, default='./outputs')
 
     args = parser.parse_args()
 
     # Load model
     print("Loading model...")
-    config = TrajectoryGPTConfig(vocab_size=280)
+    config = TrajectoryGPTConfig(vocab_size=args.vocab_size)
     model = TrajectoryGPT(config)
 
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)

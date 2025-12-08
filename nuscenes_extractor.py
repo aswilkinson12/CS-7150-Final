@@ -16,7 +16,7 @@ from tqdm import tqdm
 import pickle
 from typing import Dict, List, Tuple, Optional
 
-from trajectory_processor import create_enhanced_processor, TrajectoryConfig
+from trajectory_processor import TrajectoryProcessor, TrajectoryConfig
 
 
 class NuScenesExtractor:
@@ -30,7 +30,17 @@ class NuScenesExtractor:
         self.nusc = NuScenes(version=version, dataroot=dataroot, verbose=True)
 
         # Use processor
-        self.processor = create_enhanced_processor()
+        # Create processor with 32x32 grid (1m cells instead of 16x16 with 2m cells)
+        config = TrajectoryConfig(
+            coverage=32.0,
+            grid_size=32,      # Was 16
+            cell_size=1.0,     # Was 2.0 (must be coverage/grid_size = 32/32 = 1m)
+            history_length=4,
+            future_length=6,
+            vocab_size=1051,   # Was 280 (32*32 spatial + 24 semantic + 3 special = 1051)
+            enhanced_mode=True
+        )
+        self.processor = TrajectoryProcessor(config)
 
         print(f"Loaded {len(self.nusc.scene)} scenes")
 
@@ -205,9 +215,11 @@ class NuScenesExtractor:
         instance_token: str,
         history_length: int = 4,
         future_length: int = 6
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[Quaternion]]:
         """
         Get ego-centric trajectory
+
+        ★ CRITICAL FIX: Now returns pose and rotation for unified coordinate frame
 
         Args:
             sample_token: Current sample token
@@ -216,7 +228,8 @@ class NuScenesExtractor:
             future_length: Number of future samples
 
         Returns:
-            (history, future) or (None, None) if invalid
+            (history, future, current_pose, current_rotation) or (None, None, None, None) if invalid
+            ★ pose and rotation are from tracked vehicle for unified frame
         """
         # Get the annotation for this vehicle in this sample
         sample = self.nusc.get('sample', sample_token)
@@ -248,7 +261,7 @@ class NuScenesExtractor:
             temp_token = ann['prev']
 
         if len(history_global) < history_length:
-            return None, None
+            return None, None, None, None
 
         history_global = np.array(history_global[::-1])  # Reverse to chronological
 
@@ -263,7 +276,7 @@ class NuScenesExtractor:
             temp_token = ann['next']
 
         if len(future_global) < future_length:
-            return None, None
+            return None, None, None, None
 
         future_global = np.array(future_global)
 
@@ -289,7 +302,8 @@ class NuScenesExtractor:
         history_ego = global_to_ego(history_global, current_pose, current_rotation)
         future_ego = global_to_ego(future_global, current_pose, current_rotation)
 
-        return history_ego, future_ego
+        # ★ CRITICAL FIX: Return pose and rotation for unified frame
+        return history_ego, future_ego, current_pose, current_rotation
 
     def extract_enhanced_sample(
         self,
@@ -311,17 +325,17 @@ class NuScenesExtractor:
         """
         sample = self.nusc.get('sample', sample_token)
 
-        # Get ego trajectory
-        history, future = self._get_ego_trajectory(sample_token, instance_token)
+        # Get ego trajectory WITH pose and rotation for unified frame
+        # ★ CRITICAL FIX: Now returns pose/rotation from tracked vehicle
+        history, future, ego_pose, ego_rotation = self._get_ego_trajectory(
+            sample_token, instance_token
+        )
 
         if history is None or future is None:
             return None
 
-        # Get ego pose AND rotation for nearby agents
-        # ★ FIXED: Now get rotation too
-        ego_pose_data = self.nusc.get('ego_pose', sample['data']['LIDAR_TOP'])
-        ego_pose = np.array(ego_pose_data['translation'][:2])
-        ego_rotation = Quaternion(ego_pose_data['rotation'])
+        # ★ NOW FIXED: ego_pose and ego_rotation are from the SAME frame as history/future
+        # All agents will be transformed using the tracked vehicle's frame (not LIDAR!)
 
         # Extract scene context
         scene_context = self.get_scene_context(sample, scene)
@@ -329,12 +343,12 @@ class NuScenesExtractor:
         # Extract lane context
         lane_context = self.get_lane_context(history)
 
-        # Get nearby agents (now with rotation for transformation)
-        # ★ FIXED: Pass rotation
+        # Get nearby agents using UNIFIED frame
+        # ★ CRITICAL: Uses same pose/rotation as ego trajectory
         nearby_agents_data = self.get_nearby_agents(
             sample_token,
             ego_pose,
-            ego_rotation,  # ★ Now includes rotation
+            ego_rotation,  # ★ Now from tracked vehicle, not LIDAR!
             radius=30.0,
             max_agents=3
         )
@@ -388,8 +402,8 @@ class NuScenesExtractor:
         print("\nExtracting trajectories with TrajectoryProcessor...")
         print(f"Scene context: ✓")
         print(f"Lane context: ✓")
-        print(f"Nearby agents: ✓")
-        print(f"Velocity filter: ✓ (>2 m/s)")
+        print(f"Nearby agents: ✓ (ego-centric coordinates)")
+        print(f"Filter: Light (removes only parked vehicles, <1m movement)")
         print(f"Vocabulary: {self.processor.config.vocab_size}")
 
         dataset = []
@@ -417,12 +431,20 @@ class NuScenesExtractor:
                     )
 
                     if enhanced_sample is not None:
-                        hist_motion = np.abs(enhanced_sample['ego_history']).max()
-                        fut_motion = np.abs(enhanced_sample['ego_future']).max()
+                        # Light filter: Remove ONLY truly stationary vehicles
+                        # Keep slow traffic, stop lights, deceleration, etc.
 
-                        # Skip if total displacement < 2m (parked/stopped vehicles)
-                        if hist_motion < 2.0 or fut_motion < 2.0:
-                            continue
+                        hist = enhanced_sample['ego_history']
+                        fut = enhanced_sample['ego_future']
+
+                        # Total displacement from start to end
+                        hist_displacement = np.linalg.norm(hist[-1] - hist[0])
+                        fut_displacement = np.linalg.norm(fut[-1] - fut[0])
+
+                        # Skip ONLY if stationary in BOTH history AND future
+                        # Threshold: <1m over 2s AND <1m over 3s = truly parked
+                        if hist_displacement < 1.0 and fut_displacement < 1.0:
+                            continue  # Parked/stationary vehicle
 
                         dataset.append(enhanced_sample)
                         sample_count += 1

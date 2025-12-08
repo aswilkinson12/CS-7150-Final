@@ -275,6 +275,8 @@ def main():
                        help='Enable Weights & Biases logging')
     parser.add_argument('--resume', type=str, default=None,
                        help='Resume from checkpoint')
+    parser.add_argument('--vocab-size', type=int, default=None,
+                        help='Vocabulary size')
 
     args = parser.parse_args()
 
@@ -292,6 +294,8 @@ def main():
         config.learning_rate = args.lr
     if args.wandb:
         config.use_wandb = True
+    if args.vocab_size is not None:
+        config.vocab_size = args.vocab_size
 
     # Print configuration
     print_config(config)
