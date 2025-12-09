@@ -94,7 +94,7 @@ def compute_metrics(model, data_path, num_samples=10, num_test_samples=1000):
                     generated = model.generate(
                         input_tensor,
                         max_new_tokens=15,  # Enough for 6 future points
-                        temperature=0.7,
+                        temperature=1.0,
                         top_p=0.9,
                         end_token=end_token
                     )

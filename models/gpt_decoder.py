@@ -226,7 +226,7 @@ class TrajectoryGPT(nn.Module):
         self,
         idx: torch.Tensor,
         max_new_tokens: int,
-        temperature: float = 0.7,
+        temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         end_token: Optional[int] = None
@@ -370,7 +370,7 @@ def test_model():
     generated = model.generate(
         start_tokens,
         max_new_tokens=6,
-        temperature=0.7,
+        temperature=1.0,
         top_p=0.9
     )
 

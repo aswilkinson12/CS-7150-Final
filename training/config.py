@@ -54,7 +54,7 @@ class TrainingConfig:
     
     # Generation (for eval)
     num_samples: int = 10  # Number of diverse predictions per input
-    temperature: float = 0.7
+    temperature: float = 1.0
     top_p: float = 0.9
     
     def __post_init__(self):
