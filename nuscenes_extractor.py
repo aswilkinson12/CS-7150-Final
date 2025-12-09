@@ -37,7 +37,6 @@ class NuScenesExtractor:
             cell_size=1.0,     # Was 2.0 (must be coverage/grid_size = 32/32 = 1m)
             history_length=4,
             future_length=6,
-            vocab_size=1051,   # Was 280 (32*32 spatial + 24 semantic + 3 special = 1051)
             enhanced_mode=True
         )
         self.processor = TrajectoryProcessor(config)
@@ -243,7 +242,7 @@ class NuScenesExtractor:
                 break
 
         if ann_token is None:
-            return None, None
+            return None, None, None, None
 
         # Get current annotation
         current_ann = self.nusc.get('sample_annotation', ann_token)

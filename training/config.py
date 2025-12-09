@@ -12,7 +12,6 @@ class TrainingConfig:
     """Training hyperparameters"""
     
     # Model architecture
-    vocab_size: int = 280
     n_embd: int = 384
     n_layer: int = 6
     n_head: int = 6

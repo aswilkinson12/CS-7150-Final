@@ -15,7 +15,7 @@ class TrajectoryGPTConfig:
 
     def __init__(
         self,
-        vocab_size: int = 280,
+        vocab_size: int = 0,
         n_embd: int = 384,
         n_layer: int = 6,
         n_head: int = 6,
@@ -229,7 +229,7 @@ class TrajectoryGPT(nn.Module):
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
-        end_token: int = 258
+        end_token: Optional[int] = None
     ) -> torch.Tensor:
         """
         Generate tokens autoregressively
@@ -277,6 +277,9 @@ class TrajectoryGPT(nn.Module):
             # Sample from distribution
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
+
+            if end_token is not None and (idx_next == end_token).all():
+                break
 
             # Append to sequence
             idx = torch.cat((idx, idx_next), dim=1)

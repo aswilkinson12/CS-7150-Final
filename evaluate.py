@@ -53,13 +53,30 @@ def compute_metrics(model, data_path, num_samples=10, num_test_samples=1000):
     model.eval()
     device = next(model.parameters()).device
 
-    for sample in tqdm(test_samples, desc="Evaluating"):
-        # Get tokens from sample
-        input_tokens = sample.get('input_tokens', sample.get('input', []))
-        future_tokens_gt = sample.get('future_tokens', sample.get('target', []))
+    num_spatial = processor.config.grid_size ** 2
+    end_token = processor.config.END_TOKEN
 
-        # Filter only spatial tokens for GT
-        future_tokens_gt = [t for t in future_tokens_gt if t < 256]
+    for sample in tqdm(test_samples, desc="Evaluating"):
+        # Rebuild input WITHOUT future tokens (no leakage!)
+        history = np.array(sample['ego_history'])
+        scene_context = sample.get('scene_context', [])
+        lane_context = sample.get('lane_context', [])
+        agent_tokens = sample.get('agent_tokens', [])
+
+        history_tokens = processor.discretizer.discretize_trajectory(history)
+
+        input_tokens = (
+                [processor.config.START_TOKEN] +
+                scene_context +
+                lane_context +
+                agent_tokens +
+                history_tokens
+        )
+
+        # Ground-truth future (spatial only)
+        future = np.array(sample['ego_future'])
+        future_tokens_gt = processor.discretizer.discretize_trajectory(future)
+        future_tokens_gt = [t for t in future_tokens_gt if 0 <= t < num_spatial]
 
         is_lane_change = sample.get('is_lane_change', False)
 
@@ -79,18 +96,18 @@ def compute_metrics(model, data_path, num_samples=10, num_test_samples=1000):
                         max_new_tokens=15,  # Enough for 6 future points
                         temperature=1.0,
                         top_p=0.9,
-                        end_token=258
+                        end_token=end_token
                     )
 
                 # Extract generated tokens (after input)
                 future_pred = generated[0, len(input_tokens):].tolist()
 
                 # Remove END token if present
-                if 258 in future_pred:
-                    future_pred = future_pred[:future_pred.index(258)]
+                if end_token in future_pred:
+                    future_pred = future_pred[:future_pred.index(end_token)]
 
                 # Filter out special and semantic tokens (keep only spatial)
-                future_pred = [t for t in future_pred if t < 256]
+                future_pred = [t for t in future_pred if 0 <= t < num_spatial]
 
                 if len(future_pred) > 0:
                     predictions.append(future_pred)
