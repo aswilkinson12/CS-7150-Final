@@ -15,7 +15,7 @@ class TrajectoryGPTConfig:
 
     def __init__(
         self,
-        vocab_size: int = 0,
+        vocab_size: int = 1048,
         n_embd: int = 384,
         n_layer: int = 6,
         n_head: int = 6,

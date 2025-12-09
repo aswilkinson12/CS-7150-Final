@@ -15,6 +15,8 @@ import torch.nn as nn
 import numpy as np
 from typing import Tuple, Optional
 
+from tqdm import tqdm
+
 
 class LSTMBaseline(nn.Module):
     """
@@ -237,20 +239,22 @@ def create_lstm_dataloader(data_path: str, batch_size: int = 128, train_split: f
     """
     import pickle
     from torch.utils.data import Dataset, DataLoader
-    from trajectory_processor import TrajectoryProcessor, TrajectoryConfig
 
     # Load data
     with open(data_path, 'rb') as f:
         data = pickle.load(f)
 
-    processor = TrajectoryProcessor(TrajectoryConfig())
+    # FIX 1: Use saved config from data file
+    config = data['config']
+    from trajectory_processor import TrajectoryProcessor
+    processor = TrajectoryProcessor(config)
 
     # Convert to continuous trajectories
     dataset_list = []
     for sample in data['data']:
-        # Reconstruct trajectories from tokens
-        history = processor.discretizer.reconstruct_trajectory(sample['history_tokens'])
-        future = processor.discretizer.reconstruct_trajectory(sample['future_tokens'])
+        # FIX 2: Use ego_history/ego_future directly (not tokens)
+        history = np.array(sample['ego_history'])
+        future = np.array(sample['ego_future'])
 
         if len(history) == 4 and len(future) == 6:
             dataset_list.append({
@@ -416,6 +420,121 @@ def test_lstm_model():
 
     print("\n✓ LSTM baseline test passed!")
 
+def evaluate_lstm_baseline(
+        checkpoint_path: str = './checkpoints/lstm_baseline_best.pt',
+        data_path: str = './data/trajectories_full.pkl',
+        batch_size: int = 128
+):
+    """Evaluate LSTM baseline"""
+    import pickle
+
+    print("Evaluating LSTM Baseline...")
+
+    # Load model
+    model = LSTMBaseline(hidden_dim=128, num_layers=2)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model = model.to(device)
+    model.eval()
+
+    # Load test data
+    with open(data_path, 'rb') as f:
+        data = pickle.load(f)
+
+    test_samples = data['data'][-1000:]  # Last 1000 samples
+
+    ade_list = []
+    fde_list = []
+    lane_change_detected = 0
+    total_lane_changes = 0
+
+    with torch.no_grad():
+        for sample in tqdm(test_samples):
+            history = torch.FloatTensor(sample['ego_history']).unsqueeze(0).to(device)
+            future_gt = np.array(sample['ego_future'])
+
+            # Predict
+            pred = model.predict(history).cpu().numpy()[0]
+
+            # Metrics
+            errors = np.linalg.norm(pred - future_gt, axis=1)
+            ade_list.append(errors.mean())
+            fde_list.append(errors[-1])
+
+            # Lane change
+            if sample['is_lane_change']:
+                total_lane_changes += 1
+                lateral = abs(pred[-1, 1] - pred[0, 1])
+                if lateral > 2.0:
+                    lane_change_detected += 1
+
+    # Results
+    print("\n" + "=" * 60)
+    print("LSTM Baseline Results")
+    print("=" * 60)
+    print(f"ADE: {np.mean(ade_list):.3f} ± {np.std(ade_list):.3f} m")
+    print(f"FDE: {np.mean(fde_list):.3f} ± {np.std(fde_list):.3f} m")
+    print(f"Lane Change: {lane_change_detected / total_lane_changes * 100:.1f}%")
+    print(f"Diversity: N/A (deterministic)")
+    print("=" * 60)
+
+
+class BestOfNTrajectoryLoss(nn.Module):
+    def __init__(self, processor, K=5):
+        super().__init__()
+        self.processor = processor
+        self.K = K  # Number of samples
+
+    def forward(self, model, input_tokens, gt_future):
+        """
+        Args:
+            model: TrajectoryGPT
+            input_tokens: (batch, seq_len)
+            gt_future: (batch, 6, 2) ground truth
+        """
+        batch_size = input_tokens.size(0)
+
+        # Generate K samples per input
+        all_losses = []
+
+        for k in range(self.K):
+            # Generate trajectory
+            generated = model.generate(
+                input_tokens,
+                max_new_tokens=6,
+                temperature=1.0,  # Keep diversity
+                return_logits=True  # Need logits for backprop
+            )
+
+            # Reconstruct trajectory
+            pred_tokens = generated[:, input_tokens.size(1):]
+            pred_trajs = []
+
+            for b in range(batch_size):
+                tokens = pred_tokens[b].tolist()
+                tokens = [t for t in tokens if t < 1024]
+                traj = self.processor.discretizer.reconstruct_trajectory(tokens)
+
+                if len(traj) > 0:
+                    # Pad/truncate to 6 waypoints
+                    if len(traj) < 6:
+                        traj = np.pad(traj, ((0, 6 - len(traj)), (0, 0)))
+                    else:
+                        traj = traj[:6]
+                    pred_trajs.append(traj)
+
+            pred_trajs = torch.FloatTensor(pred_trajs).to(gt_future.device)
+
+            # Compute loss for this sample
+            loss = F.mse_loss(pred_trajs, gt_future)
+            all_losses.append(loss)
+
+        # Only use best (minimum loss)
+        best_loss = torch.stack(all_losses).min()
+
+        return best_loss
 
 if __name__ == "__main__":
     import sys

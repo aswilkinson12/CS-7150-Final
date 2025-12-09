@@ -11,6 +11,8 @@ import sys
 import os
 import json
 
+from baseline import LSTMBaseline
+
 sys.path.append('.')
 from models.gpt_decoder import TrajectoryGPT, TrajectoryGPTConfig
 from trajectory_processor import TrajectoryProcessor
