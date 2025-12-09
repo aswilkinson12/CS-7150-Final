@@ -32,7 +32,7 @@ class TrainingConfig:
     min_lr: float = 1e-5
     
     # Data
-    data_path: str = './data/trajectories_mini.pkl'
+    data_path: str = './data/trajectories_full.pkl'
     val_path: Optional[str] = None
     val_split: float = 0.1
     num_workers: int = 4
@@ -54,7 +54,7 @@ class TrainingConfig:
     
     # Generation (for eval)
     num_samples: int = 10  # Number of diverse predictions per input
-    temperature: float = 1.0
+    temperature: float = 0.7
     top_p: float = 0.9
     
     def __post_init__(self):

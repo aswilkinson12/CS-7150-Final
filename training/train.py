@@ -277,6 +277,9 @@ def main():
                        help='Resume from checkpoint')
     parser.add_argument('--vocab-size', type=int, default=None,
                         help='Vocabulary size')
+    parser.add_argument('--temperature', type=float, default=None,
+                        help='Temperature')
+
 
     args = parser.parse_args()
 
@@ -296,6 +299,8 @@ def main():
         config.use_wandb = True
     if args.vocab_size is not None:
         config.vocab_size = args.vocab_size
+    if args.temperature is not None:
+        config.temperature = args.temperature
 
     # Print configuration
     print_config(config)
